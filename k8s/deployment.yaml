@@ -11,6 +11,9 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "create", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -44,3 +47,29 @@ spec:
       containers:
         - name: service-leader-elector
           image: ghcr.io/chia-network/service-leader-elector:latest
+          ports:
+            - containerPort: 8080
+              name: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-leader-elector
+spec:
+  selector:
+    app: service-leader-elector
+  ports:
+    - port: 8080
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: service-leader-elector-leader
+spec:
+  selector:
+    app: service-leader-elector
+    leader: "true"
+  ports:
+    - port: 8080
+      targetPort: http

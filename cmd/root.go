@@ -18,7 +18,7 @@ var (
 // rootCmd represents the base command when called without any subcommands
 var rootCmd = &cobra.Command{
 	Use:     "service-leader-elector",
-	Short:   "k8s leader election for integration with readiness probes",
+	Short:   "k8s leader election that labels the leader pod for Service routing",
 	Version: versionString(true),
 }
 
