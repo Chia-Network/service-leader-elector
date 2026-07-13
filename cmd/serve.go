@@ -20,13 +20,16 @@ var serveCmd = &cobra.Command{
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 
+		serverDone := make(chan struct{})
 		go func() {
+			defer close(serverDone)
 			if err := server.Run(ctx, viper.GetInt("port")); err != nil {
 				slogs.Logr.Fatal("status server", "error", err)
 			}
 		}()
 
 		election.Run(ctx, viper.GetString("lease-name"))
+		<-serverDone
 	},
 }
 

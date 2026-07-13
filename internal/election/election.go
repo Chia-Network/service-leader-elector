@@ -87,18 +87,9 @@ func Run(ctx context.Context, leaseName string) {
 		ReleaseOnCancel: true,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				leading.Store(true)
-				defer func() {
-					leading.Store(false)
-					if err := clearLeaderLabel(context.Background(), client, namespace, identity); err != nil {
-						slogs.Logr.Warn("clearing leader label after leading",
-							"error", err,
-							"namespace", namespace,
-							"pod", identity,
-						)
-					}
-				}()
-
+				// Set the Service selector label before advertising leadership,
+				// and clear it before returning so the lease is not released
+				// (ReleaseOnCancel) until this pod is already deselected.
 				if err := setLeaderLabel(ctx, client, namespace, identity); err != nil {
 					slogs.Logr.Fatal("setting leader label",
 						"error", err,
@@ -106,6 +97,18 @@ func Run(ctx context.Context, leaseName string) {
 						"pod", identity,
 					)
 				}
+				leading.Store(true)
+
+				defer func() {
+					if err := clearLeaderLabel(context.Background(), client, namespace, identity); err != nil {
+						slogs.Logr.Warn("clearing leader label after leading",
+							"error", err,
+							"namespace", namespace,
+							"pod", identity,
+						)
+					}
+					leading.Store(false)
+				}()
 
 				slogs.Logr.Info("became leader",
 					"lease", leaseName,
@@ -115,7 +118,6 @@ func Run(ctx context.Context, leaseName string) {
 				<-ctx.Done()
 			},
 			OnStoppedLeading: func() {
-				leading.Store(false)
 				if err := clearLeaderLabel(context.Background(), client, namespace, identity); err != nil {
 					slogs.Logr.Warn("clearing leader label on stop",
 						"error", err,
@@ -123,6 +125,7 @@ func Run(ctx context.Context, leaseName string) {
 						"pod", identity,
 					)
 				}
+				leading.Store(false)
 
 				slogs.Logr.Warn("stopped leading",
 					"lease", leaseName,
