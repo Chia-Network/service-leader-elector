@@ -44,12 +44,3 @@ spec:
       containers:
         - name: service-leader-elector
           image: ghcr.io/chia-network/service-leader-elector:latest
-          env:
-            - name: POD_NAME
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
