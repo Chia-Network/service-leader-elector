@@ -87,11 +87,11 @@ func Run(ctx context.Context, cfg Config) {
 	// heldLeadership tracks whether we successfully became leader so demote
 	// signaling runs at most once per leadership term and only after real leadership.
 	var heldLeadership atomic.Bool
-	// leadingTerm counts an in-flight OnStartedLeading callback (including its
-	// demotion cleanup). client-go runs that callback in a goroutine and does not
-	// wait for it before Run returns, so OnStoppedLeading and the re-entry loop
-	// must Wait to avoid overlapping terms.
-	var leadingTerm sync.WaitGroup
+
+	// term is the in-flight election round. WaitGroup.Add(1) happens on this
+	// goroutine before RunOrDie so Wait cannot race a zero-counter Add from the
+	// OnStartedLeading goroutine.
+	var term atomic.Pointer[electionTerm]
 
 	lec := leaderelection.LeaderElectionConfig{
 		Lock:            lock,
@@ -101,17 +101,27 @@ func Run(ctx context.Context, cfg Config) {
 		ReleaseOnCancel: true,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
-				leadingTerm.Add(1)
-				defer leadingTerm.Done()
+				t := term.Load()
+				t.started.Store(true)
+				defer t.finish()
 
-				// Clear label before returning so ReleaseOnCancel does not hand
-				// off the lease while this pod is still selected by the Service.
+				// Demotion cleanup: signal co-process even if label clear Fatals.
 				defer func() {
-					mustClearLeaderLabel(context.Background(), client, namespace, identity, "after leading")
-					if heldLeadership.Swap(false) {
+					wasLeader := heldLeadership.Swap(false)
+					leading.Store(false)
+
+					clearErr := clearLeaderLabelRetries(context.Background(), client, namespace, identity, "after leading")
+					if wasLeader {
 						signalOnStoppedLeading(cfg)
 					}
-					leading.Store(false)
+					if clearErr != nil {
+						slogs.Logr.Fatal("clearing leader label",
+							"error", clearErr,
+							"reason", "after leading",
+							"namespace", namespace,
+							"pod", identity,
+						)
+					}
 				}()
 
 				// Set the Service selector label before advertising leadership.
@@ -137,15 +147,27 @@ func Run(ctx context.Context, cfg Config) {
 				<-ctx.Done()
 			},
 			OnStoppedLeading: func() {
-				// Run cancels OnStartedLeading then calls this without waiting;
-				// block until that callback's demotion cleanup finishes.
-				leadingTerm.Wait()
+				t := term.Load()
+				// Run cancels OnStartedLeading then calls this without waiting.
+				// Wait for that callback to finish, or release the pre-Add if it
+				// never started (acquire failed).
+				waitForElectionTerm(t)
+				t.wg.Wait()
 
-				mustClearLeaderLabel(context.Background(), client, namespace, identity, "stopped leading")
-				if heldLeadership.Swap(false) {
+				wasLeader := heldLeadership.Swap(false)
+				leading.Store(false)
+				clearErr := clearLeaderLabelRetries(context.Background(), client, namespace, identity, "stopped leading")
+				if wasLeader {
 					signalOnStoppedLeading(cfg)
 				}
-				leading.Store(false)
+				if clearErr != nil {
+					slogs.Logr.Fatal("clearing leader label",
+						"error", clearErr,
+						"reason", "stopped leading",
+						"namespace", namespace,
+						"pod", identity,
+					)
+				}
 
 				slogs.Logr.Warn("stopped leading",
 					"lease", cfg.LeaseName,
@@ -174,10 +196,13 @@ func Run(ctx context.Context, cfg Config) {
 		if ctx.Err() != nil {
 			return
 		}
+
+		t := newElectionTerm()
+		term.Store(t)
 		leaderelection.RunOrDie(ctx, lec)
-		// Belt-and-suspenders with OnStoppedLeading's Wait: do not contend again
-		// until any OnStartedLeading cleanup from this term is finished.
-		leadingTerm.Wait()
+		waitForElectionTerm(t)
+		t.wg.Wait()
+
 		if ctx.Err() != nil {
 			return
 		}
@@ -186,6 +211,39 @@ func Run(ctx context.Context, cfg Config) {
 			"namespace", namespace,
 			"identity", identity,
 		)
+	}
+}
+
+// electionTerm synchronizes one client-go Run() cycle with OnStartedLeading cleanup.
+type electionTerm struct {
+	wg         sync.WaitGroup
+	finishOnce sync.Once
+	started    atomic.Bool
+}
+
+func newElectionTerm() *electionTerm {
+	t := &electionTerm{}
+	t.wg.Add(1)
+	return t
+}
+
+func (t *electionTerm) finish() {
+	t.finishOnce.Do(t.wg.Done)
+}
+
+// waitForElectionTerm blocks until OnStartedLeading has claimed the term or it
+// is clear the callback will never run (acquire failed), then ensures finish().
+func waitForElectionTerm(t *electionTerm) {
+	if t == nil {
+		return
+	}
+	deadline := time.Now().Add(retryPeriod)
+	for !t.started.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !t.started.Load() {
+		// OnStartedLeading never ran (or did not claim in time); release Add(1).
+		t.finish()
 	}
 }
 
@@ -221,14 +279,13 @@ func clearLeaderLabel(ctx context.Context, client kubernetes.Interface, namespac
 	return nil
 }
 
-// mustClearLeaderLabel retries clearing the leader label and Fatals if it cannot,
-// so a former leader cannot keep receiving traffic via the leader Service.
-func mustClearLeaderLabel(ctx context.Context, client kubernetes.Interface, namespace, podName, reason string) {
+// clearLeaderLabelRetries retries clearing the leader label and returns the last error.
+func clearLeaderLabelRetries(ctx context.Context, client kubernetes.Interface, namespace, podName, reason string) error {
 	var err error
 	for attempt := 1; attempt <= labelClearAttempts; attempt++ {
 		err = clearLeaderLabel(ctx, client, namespace, podName)
 		if err == nil {
-			return
+			return nil
 		}
 		slogs.Logr.Warn("clearing leader label",
 			"error", err,
@@ -249,12 +306,20 @@ func mustClearLeaderLabel(ctx context.Context, client kubernetes.Interface, name
 		case <-timer.C:
 		}
 	}
-	slogs.Logr.Fatal("clearing leader label",
-		"error", err,
-		"reason", reason,
-		"namespace", namespace,
-		"pod", podName,
-	)
+	return err
+}
+
+// mustClearLeaderLabel retries clearing the leader label and Fatals if it cannot,
+// so a former leader cannot keep receiving traffic via the leader Service.
+func mustClearLeaderLabel(ctx context.Context, client kubernetes.Interface, namespace, podName, reason string) {
+	if err := clearLeaderLabelRetries(ctx, client, namespace, podName, reason); err != nil {
+		slogs.Logr.Fatal("clearing leader label",
+			"error", err,
+			"reason", reason,
+			"namespace", namespace,
+			"pod", podName,
+		)
+	}
 }
 
 func currentNamespace() string {
