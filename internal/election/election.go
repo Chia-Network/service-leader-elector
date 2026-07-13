@@ -100,7 +100,7 @@ func Run(ctx context.Context, cfg Config) {
 		RetryPeriod:     retryPeriod,
 		ReleaseOnCancel: true,
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(ctx context.Context) {
+			OnStartedLeading: func(leCtx context.Context) {
 				t := term.Load()
 				t.started.Store(true)
 				defer t.finish()
@@ -125,15 +125,14 @@ func Run(ctx context.Context, cfg Config) {
 				}()
 
 				// Set the Service selector label before advertising leadership.
-				// On failure, cancel election and return so the lease is released
-				// instead of Fatal (which would skip cleanup).
-				if err := setLeaderLabel(ctx, client, namespace, identity); err != nil {
+				// On failure, cancel only this term so the outer loop can retry.
+				if err := setLeaderLabel(leCtx, client, namespace, identity); err != nil {
 					slogs.Logr.Error("setting leader label",
 						"error", err,
 						"namespace", namespace,
 						"pod", identity,
 					)
-					cancel()
+					t.cancel()
 					return
 				}
 				leading.Store(true)
@@ -144,29 +143,16 @@ func Run(ctx context.Context, cfg Config) {
 					"namespace", namespace,
 					"identity", identity,
 				)
-				<-ctx.Done()
+				<-leCtx.Done()
 			},
 			OnStoppedLeading: func() {
 				t := term.Load()
 				// Run cancels OnStartedLeading then calls this without waiting.
-				// Wait for that callback to finish, or release the pre-Add if it
-				// never started (acquire failed).
-				waitForElectionTerm(t)
-				t.wg.Wait()
-
-				wasLeader := heldLeadership.Swap(false)
-				leading.Store(false)
-				clearErr := clearLeaderLabelRetries(context.Background(), client, namespace, identity, "stopped leading")
-				if wasLeader {
-					signalOnStoppedLeading(cfg)
-				}
-				if clearErr != nil {
-					slogs.Logr.Fatal("clearing leader label",
-						"error", clearErr,
-						"reason", "stopped leading",
-						"namespace", namespace,
-						"pod", identity,
-					)
+				// Wait for that callback's demotion cleanup; do not repeat it
+				// (redundant clear can Fatal after the first already succeeded).
+				waitForElectionTerm(ctx, t)
+				if t != nil {
+					t.wg.Wait()
 				}
 
 				slogs.Logr.Warn("stopped leading",
@@ -197,11 +183,14 @@ func Run(ctx context.Context, cfg Config) {
 			return
 		}
 
-		t := newElectionTerm()
+		termCtx, termCancel := context.WithCancel(ctx)
+		t := newElectionTerm(termCancel)
 		term.Store(t)
-		leaderelection.RunOrDie(ctx, lec)
-		waitForElectionTerm(t)
+
+		leaderelection.RunOrDie(termCtx, lec)
+		waitForElectionTerm(ctx, t)
 		t.wg.Wait()
+		termCancel()
 
 		if ctx.Err() != nil {
 			return
@@ -219,10 +208,11 @@ type electionTerm struct {
 	wg         sync.WaitGroup
 	finishOnce sync.Once
 	started    atomic.Bool
+	cancel     context.CancelFunc
 }
 
-func newElectionTerm() *electionTerm {
-	t := &electionTerm{}
+func newElectionTerm(cancel context.CancelFunc) *electionTerm {
+	t := &electionTerm{cancel: cancel}
 	t.wg.Add(1)
 	return t
 }
@@ -233,13 +223,27 @@ func (t *electionTerm) finish() {
 
 // waitForElectionTerm blocks until OnStartedLeading has claimed the term or it
 // is clear the callback will never run (acquire failed), then ensures finish().
-func waitForElectionTerm(t *electionTerm) {
+func waitForElectionTerm(ctx context.Context, t *electionTerm) {
 	if t == nil {
 		return
 	}
 	deadline := time.Now().Add(retryPeriod)
-	for !t.started.Load() && time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
+	for !t.started.Load() {
+		if ctx.Err() != nil {
+			t.finish()
+			return
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			t.finish()
+			return
+		case <-timer.C:
+		}
 	}
 	if !t.started.Load() {
 		// OnStartedLeading never ran (or did not claim in time); release Add(1).

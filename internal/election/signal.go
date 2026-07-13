@@ -116,7 +116,9 @@ func findPIDsByCmdline(substr string) ([]int, error) {
 		return nil, err
 	}
 
-	needle := []byte(substr)
+	// /proc/*/cmdline is NUL-separated args; treat spaces in the match like
+	// argument boundaries (same idea as pgrep -f with a multi-word pattern).
+	needle := cmdlineNeedle(substr)
 	var pids []int
 	for _, ent := range entries {
 		if !ent.IsDir() {
@@ -130,11 +132,18 @@ func findPIDsByCmdline(substr string) ([]int, error) {
 		if err != nil {
 			continue
 		}
-		// /proc/pid/cmdline is NUL-separated; search the raw bytes.
 		if !bytes.Contains(cmdline, needle) {
 			continue
 		}
 		pids = append(pids, pid)
 	}
 	return pids, nil
+}
+
+func cmdlineNeedle(substr string) []byte {
+	fields := strings.Fields(substr)
+	if len(fields) == 0 {
+		return nil
+	}
+	return []byte(strings.Join(fields, "\x00"))
 }
