@@ -26,6 +26,9 @@ const (
 	labelClearAttempts = 5
 	// Cap exponential backoff after setLeaderLabel failures at retryPeriod<<4 (32s).
 	maxLabelFailShift = 4
+	// Wait after demote signal before re-contending so the co-process can exit
+	// and restart before this pod may become leader again.
+	demoteSignalBackoff = leaseDuration
 
 	serviceAccountNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
@@ -92,6 +95,9 @@ func Run(ctx context.Context, cfg Config) {
 	// consecutiveLabelFails backs off re-entry after setLeaderLabel failures so
 	// permanent errors (e.g. RBAC) do not tight-loop against the API server.
 	var consecutiveLabelFails atomic.Int32
+	// demoteSignaled means this term sent a co-process demote signal; re-entry
+	// must wait so we do not reclaim leadership while that process is restarting.
+	var demoteSignaled atomic.Bool
 
 	// term is the in-flight election round. WaitGroup.Add(1) happens on this
 	// goroutine before RunOrDie so Wait cannot race a zero-counter Add from the
@@ -116,8 +122,9 @@ func Run(ctx context.Context, cfg Config) {
 					leading.Store(false)
 
 					clearErr := clearLeaderLabelRetries(context.Background(), client, namespace, identity, "after leading")
-					if wasLeader {
+					if wasLeader && strings.TrimSpace(cfg.OnStoppedLeadingProcess) != "" {
 						signalOnStoppedLeading(cfg)
+						demoteSignaled.Store(true)
 					}
 					if clearErr != nil {
 						slogs.Logr.Fatal("clearing leader label",
@@ -204,7 +211,19 @@ func Run(ctx context.Context, cfg Config) {
 			return
 		}
 
-		if fails := consecutiveLabelFails.Load(); fails > 0 {
+		if demoteSignaled.Swap(false) {
+			slogs.Logr.Info("backing off before re-entering election after demote signal",
+				"backoff", demoteSignalBackoff,
+				"lease", cfg.LeaseName,
+			)
+			timer := time.NewTimer(demoteSignalBackoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		} else if fails := consecutiveLabelFails.Load(); fails > 0 {
 			shift := fails - 1
 			if shift > maxLabelFailShift {
 				shift = maxLabelFailShift
