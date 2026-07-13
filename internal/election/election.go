@@ -4,10 +4,13 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/chia-network/go-modules/pkg/slogs"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/leaderelection"
@@ -19,12 +22,31 @@ const (
 	renewDeadline = 10 * time.Second
 	retryPeriod   = 2 * time.Second
 
+	labelClearAttempts = 5
+
 	serviceAccountNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
+	// LeaderLabelKey is set to LeaderLabelValue on the elected leader pod so
+	// Services can select only that pod.
+	LeaderLabelKey = "leader"
+	// LeaderLabelValue is the value applied to LeaderLabelKey on the leader pod.
+	LeaderLabelValue = "true"
 )
+
+var leading atomic.Bool
+
+// IsLeader reports whether this process currently holds the lease.
+func IsLeader() bool {
+	return leading.Load()
+}
 
 // Run contends for a namespaced Lease and blocks until ctx is cancelled.
 // Namespace is always the current pod namespace; identity and timings use fixed defaults.
+// While leading, the pod is labeled leader=true for Service routing.
 func Run(ctx context.Context, leaseName string) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	config, err := rest.InClusterConfig()
 	if err != nil {
 		slogs.Logr.Fatal("building in-cluster config", "error", err)
@@ -43,6 +65,10 @@ func Run(ctx context.Context, leaseName string) {
 		"namespace", namespace,
 		"identity", identity,
 	)
+
+	// Clear any stale leader label from a previous run before contending.
+	// Failure is fatal: a leftover leader=true would keep this pod in the leader Service.
+	mustClearLeaderLabel(ctx, client, namespace, identity, "startup")
 
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
@@ -63,6 +89,27 @@ func Run(ctx context.Context, leaseName string) {
 		ReleaseOnCancel: true,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
+				// Clear label before returning so ReleaseOnCancel does not hand
+				// off the lease while this pod is still selected by the Service.
+				defer func() {
+					mustClearLeaderLabel(context.Background(), client, namespace, identity, "after leading")
+					leading.Store(false)
+				}()
+
+				// Set the Service selector label before advertising leadership.
+				// On failure, cancel election and return so the lease is released
+				// instead of Fatal (which would skip cleanup).
+				if err := setLeaderLabel(ctx, client, namespace, identity); err != nil {
+					slogs.Logr.Error("setting leader label",
+						"error", err,
+						"namespace", namespace,
+						"pod", identity,
+					)
+					cancel()
+					return
+				}
+				leading.Store(true)
+
 				slogs.Logr.Info("became leader",
 					"lease", leaseName,
 					"namespace", namespace,
@@ -71,6 +118,9 @@ func Run(ctx context.Context, leaseName string) {
 				<-ctx.Done()
 			},
 			OnStoppedLeading: func() {
+				mustClearLeaderLabel(context.Background(), client, namespace, identity, "stopped leading")
+				leading.Store(false)
+
 				slogs.Logr.Warn("stopped leading",
 					"lease", leaseName,
 					"namespace", namespace,
@@ -90,6 +140,74 @@ func Run(ctx context.Context, leaseName string) {
 			},
 		},
 	})
+}
+
+func setLeaderLabel(ctx context.Context, client kubernetes.Interface, namespace, podName string) error {
+	patch := []byte(`{"metadata":{"labels":{"` + LeaderLabelKey + `":"` + LeaderLabelValue + `"}}}`)
+	_, err := client.CoreV1().Pods(namespace).Patch(ctx, podName, types.MergePatchType, patch, metav1.PatchOptions{})
+	if err != nil {
+		return err
+	}
+	slogs.Logr.Info("set leader label",
+		"namespace", namespace,
+		"pod", podName,
+		"label", LeaderLabelKey+"="+LeaderLabelValue,
+	)
+	return nil
+}
+
+func clearLeaderLabel(ctx context.Context, client kubernetes.Interface, namespace, podName string) error {
+	patch := []byte(`{"metadata":{"labels":{"` + LeaderLabelKey + `":null}}}`)
+	_, err := client.CoreV1().Pods(namespace).Patch(ctx, podName, types.MergePatchType, patch, metav1.PatchOptions{})
+	if err != nil {
+		// Pod already gone — it cannot remain selected by the leader Service.
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	slogs.Logr.Info("cleared leader label",
+		"namespace", namespace,
+		"pod", podName,
+		"label", LeaderLabelKey,
+	)
+	return nil
+}
+
+// mustClearLeaderLabel retries clearing the leader label and Fatals if it cannot,
+// so a former leader cannot keep receiving traffic via the leader Service.
+func mustClearLeaderLabel(ctx context.Context, client kubernetes.Interface, namespace, podName, reason string) {
+	var err error
+	for attempt := 1; attempt <= labelClearAttempts; attempt++ {
+		err = clearLeaderLabel(ctx, client, namespace, podName)
+		if err == nil {
+			return
+		}
+		slogs.Logr.Warn("clearing leader label",
+			"error", err,
+			"attempt", attempt,
+			"reason", reason,
+			"namespace", namespace,
+			"pod", podName,
+		)
+		if attempt == labelClearAttempts {
+			break
+		}
+		timer := time.NewTimer(retryPeriod)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			// Keep retrying with a detached context so demotion still clears the label.
+			ctx = context.Background()
+		case <-timer.C:
+		}
+	}
+	slogs.Logr.Fatal("clearing leader label",
+		"error", err,
+		"reason", reason,
+		"namespace", namespace,
+		"pod", podName,
+	)
 }
 
 func currentNamespace() string {
