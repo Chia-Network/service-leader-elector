@@ -2,3 +2,4 @@ main
 bin/
 idea/*
 *.log
+k8s/deployment-dev.yaml
