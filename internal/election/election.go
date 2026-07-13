@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -86,6 +87,11 @@ func Run(ctx context.Context, cfg Config) {
 	// heldLeadership tracks whether we successfully became leader so demote
 	// signaling runs at most once per leadership term and only after real leadership.
 	var heldLeadership atomic.Bool
+	// leadingTerm counts an in-flight OnStartedLeading callback (including its
+	// demotion cleanup). client-go runs that callback in a goroutine and does not
+	// wait for it before Run returns, so OnStoppedLeading and the re-entry loop
+	// must Wait to avoid overlapping terms.
+	var leadingTerm sync.WaitGroup
 
 	lec := leaderelection.LeaderElectionConfig{
 		Lock:            lock,
@@ -95,6 +101,9 @@ func Run(ctx context.Context, cfg Config) {
 		ReleaseOnCancel: true,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(ctx context.Context) {
+				leadingTerm.Add(1)
+				defer leadingTerm.Done()
+
 				// Clear label before returning so ReleaseOnCancel does not hand
 				// off the lease while this pod is still selected by the Service.
 				defer func() {
@@ -128,6 +137,10 @@ func Run(ctx context.Context, cfg Config) {
 				<-ctx.Done()
 			},
 			OnStoppedLeading: func() {
+				// Run cancels OnStartedLeading then calls this without waiting;
+				// block until that callback's demotion cleanup finishes.
+				leadingTerm.Wait()
+
 				mustClearLeaderLabel(context.Background(), client, namespace, identity, "stopped leading")
 				if heldLeadership.Swap(false) {
 					signalOnStoppedLeading(cfg)
@@ -162,6 +175,9 @@ func Run(ctx context.Context, cfg Config) {
 			return
 		}
 		leaderelection.RunOrDie(ctx, lec)
+		// Belt-and-suspenders with OnStoppedLeading's Wait: do not contend again
+		// until any OnStartedLeading cleanup from this term is finished.
+		leadingTerm.Wait()
 		if ctx.Err() != nil {
 			return
 		}
