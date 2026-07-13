@@ -122,14 +122,22 @@ func Run(ctx context.Context, cfg Config) {
 					leading.Store(false)
 
 					clearErr := clearLeaderLabelRetries(context.Background(), client, namespace, identity, "after leading")
-					if wasLeader && strings.TrimSpace(cfg.OnStoppedLeadingProcess) != "" {
-						signalOnStoppedLeading(cfg)
+					if wasLeader && signalOnStoppedLeading(cfg) {
 						demoteSignaled.Store(true)
 					}
-					if clearErr != nil {
+					if clearErr != nil && wasLeader {
+						// Only Fatal if we actually held leadership — a stale
+						// label is dangerous. If we never set the label
+						// (wasLeader=false), let the retry loop handle it.
 						slogs.Logr.Fatal("clearing leader label",
 							"error", clearErr,
 							"reason", "after leading",
+							"namespace", namespace,
+							"pod", identity,
+						)
+					} else if clearErr != nil {
+						slogs.Logr.Error("clearing leader label (never held leadership, will retry)",
+							"error", clearErr,
 							"namespace", namespace,
 							"pod", identity,
 						)

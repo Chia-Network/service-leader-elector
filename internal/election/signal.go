@@ -58,10 +58,12 @@ func ParseSignal(s string) (syscall.Signal, error) {
 	return syscall.Signal(n), nil
 }
 
-func signalOnStoppedLeading(cfg Config) {
+// signalOnStoppedLeading sends the configured signal to matching co-processes.
+// Returns true if at least one signal was successfully delivered.
+func signalOnStoppedLeading(cfg Config) bool {
 	match := strings.TrimSpace(cfg.OnStoppedLeadingProcess)
 	if match == "" {
-		return
+		return false
 	}
 
 	sig := cfg.demoteSignal()
@@ -72,7 +74,7 @@ func signalOnStoppedLeading(cfg Config) {
 			"error", err,
 			"match", match,
 		)
-		return
+		return false
 	}
 
 	targets := pids[:0]
@@ -89,9 +91,10 @@ func signalOnStoppedLeading(cfg Config) {
 			"self_tgid", selfTGID,
 			"matched_only_self", len(pids) > 0,
 		)
-		return
+		return false
 	}
 
+	delivered := false
 	for _, pid := range targets {
 		if err := unix.Kill(pid, sig); err != nil {
 			slogs.Logr.Error("sending demote signal",
@@ -102,12 +105,14 @@ func signalOnStoppedLeading(cfg Config) {
 			)
 			continue
 		}
+		delivered = true
 		slogs.Logr.Info("sent demote signal",
 			"pid", pid,
 			"signal", sig.String(),
 			"match", match,
 		)
 	}
+	return delivered
 }
 
 func findPIDsByCmdline(substr string) ([]int, error) {
