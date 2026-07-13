@@ -43,6 +43,7 @@ func IsLeader() bool {
 // Run contends for a namespaced Lease and blocks until ctx is cancelled.
 // Namespace is always the current pod namespace; identity and timings use fixed defaults.
 // While leading, the pod is labeled leader=true for Service routing.
+// If the lease is lost, demotion cleanup runs and election is re-entered until ctx ends.
 func Run(ctx context.Context, cfg Config) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -83,10 +84,10 @@ func Run(ctx context.Context, cfg Config) {
 	}
 
 	// heldLeadership tracks whether we successfully became leader so demote
-	// signaling runs at most once and only after real leadership.
+	// signaling runs at most once per leadership term and only after real leadership.
 	var heldLeadership atomic.Bool
 
-	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
+	lec := leaderelection.LeaderElectionConfig{
 		Lock:            lock,
 		LeaseDuration:   leaseDuration,
 		RenewDeadline:   renewDeadline,
@@ -151,7 +152,25 @@ func Run(ctx context.Context, cfg Config) {
 				)
 			},
 		},
-	})
+	}
+
+	// client-go's Run returns once this instance stops holding the lease; it does
+	// not re-acquire. Loop until the parent context is cancelled so demotion
+	// (label clear + optional co-process signal) is followed by renewed contention.
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		leaderelection.RunOrDie(ctx, lec)
+		if ctx.Err() != nil {
+			return
+		}
+		slogs.Logr.Info("lease lost; re-entering leader election",
+			"lease", cfg.LeaseName,
+			"namespace", namespace,
+			"identity", identity,
+		)
+	}
 }
 
 func setLeaderLabel(ctx context.Context, client kubernetes.Interface, namespace, podName string) error {

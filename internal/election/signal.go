@@ -73,19 +73,26 @@ func signalOnStoppedLeading(cfg Config) {
 		)
 		return
 	}
-	if len(pids) == 0 {
-		slogs.Logr.Error("no processes matched for demote signal",
-			"match", match,
-			"signal", sig.String(),
-		)
-		return
-	}
 
 	self := os.Getpid()
+	targets := pids[:0]
 	for _, pid := range pids {
 		if pid == self {
 			continue
 		}
+		targets = append(targets, pid)
+	}
+	if len(targets) == 0 {
+		slogs.Logr.Error("no processes matched for demote signal",
+			"match", match,
+			"signal", sig.String(),
+			"self_pid", self,
+			"matched_only_self", len(pids) > 0,
+		)
+		return
+	}
+
+	for _, pid := range targets {
 		if err := unix.Kill(pid, sig); err != nil {
 			slogs.Logr.Error("sending demote signal",
 				"error", err,
