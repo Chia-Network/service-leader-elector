@@ -43,7 +43,7 @@ func IsLeader() bool {
 // Run contends for a namespaced Lease and blocks until ctx is cancelled.
 // Namespace is always the current pod namespace; identity and timings use fixed defaults.
 // While leading, the pod is labeled leader=true for Service routing.
-func Run(ctx context.Context, leaseName string) {
+func Run(ctx context.Context, cfg Config) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -61,9 +61,10 @@ func Run(ctx context.Context, leaseName string) {
 	identity := identity()
 
 	slogs.Logr.Info("starting leader election",
-		"lease", leaseName,
+		"lease", cfg.LeaseName,
 		"namespace", namespace,
 		"identity", identity,
+		"on_stopped_leading_process", cfg.OnStoppedLeadingProcess,
 	)
 
 	// Clear any stale leader label from a previous run before contending.
@@ -72,7 +73,7 @@ func Run(ctx context.Context, leaseName string) {
 
 	lock := &resourcelock.LeaseLock{
 		LeaseMeta: metav1.ObjectMeta{
-			Name:      leaseName,
+			Name:      cfg.LeaseName,
 			Namespace: namespace,
 		},
 		Client: client.CoordinationV1(),
@@ -80,6 +81,10 @@ func Run(ctx context.Context, leaseName string) {
 			Identity: identity,
 		},
 	}
+
+	// heldLeadership tracks whether we successfully became leader so demote
+	// signaling runs at most once and only after real leadership.
+	var heldLeadership atomic.Bool
 
 	leaderelection.RunOrDie(ctx, leaderelection.LeaderElectionConfig{
 		Lock:            lock,
@@ -93,6 +98,9 @@ func Run(ctx context.Context, leaseName string) {
 				// off the lease while this pod is still selected by the Service.
 				defer func() {
 					mustClearLeaderLabel(context.Background(), client, namespace, identity, "after leading")
+					if heldLeadership.Swap(false) {
+						signalOnStoppedLeading(cfg)
+					}
 					leading.Store(false)
 				}()
 
@@ -109,9 +117,10 @@ func Run(ctx context.Context, leaseName string) {
 					return
 				}
 				leading.Store(true)
+				heldLeadership.Store(true)
 
 				slogs.Logr.Info("became leader",
-					"lease", leaseName,
+					"lease", cfg.LeaseName,
 					"namespace", namespace,
 					"identity", identity,
 				)
@@ -119,10 +128,13 @@ func Run(ctx context.Context, leaseName string) {
 			},
 			OnStoppedLeading: func() {
 				mustClearLeaderLabel(context.Background(), client, namespace, identity, "stopped leading")
+				if heldLeadership.Swap(false) {
+					signalOnStoppedLeading(cfg)
+				}
 				leading.Store(false)
 
 				slogs.Logr.Warn("stopped leading",
-					"lease", leaseName,
+					"lease", cfg.LeaseName,
 					"namespace", namespace,
 					"identity", identity,
 				)
@@ -132,7 +144,7 @@ func Run(ctx context.Context, leaseName string) {
 					return
 				}
 				slogs.Logr.Info("new leader observed",
-					"lease", leaseName,
+					"lease", cfg.LeaseName,
 					"namespace", namespace,
 					"leader", current,
 					"identity", identity,
