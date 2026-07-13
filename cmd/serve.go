@@ -20,16 +20,23 @@ var serveCmd = &cobra.Command{
 		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 		defer stop()
 
-		serverDone := make(chan struct{})
+		serverErr := make(chan error, 1)
 		go func() {
-			defer close(serverDone)
-			if err := server.Run(ctx, viper.GetInt("port")); err != nil {
-				slogs.Logr.Fatal("status server", "error", err)
+			err := server.Run(ctx, viper.GetInt("port"))
+			if err != nil {
+				// Cancel election first so leader label / lease cleanup can run
+				// before the process exits.
+				slogs.Logr.Error("status server failed, shutting down", "error", err)
+				stop()
 			}
+			serverErr <- err
 		}()
 
 		election.Run(ctx, viper.GetString("lease-name"))
-		<-serverDone
+
+		if err := <-serverErr; err != nil {
+			slogs.Logr.Fatal("status server", "error", err)
+		}
 	},
 }
 
