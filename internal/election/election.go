@@ -25,7 +25,8 @@ const (
 
 	// LeaderLabelKey is set to LeaderLabelValue on the elected leader pod so
 	// Services can select only that pod.
-	LeaderLabelKey   = "leader"
+	LeaderLabelKey = "leader"
+	// LeaderLabelValue is the value applied to LeaderLabelKey on the leader pod.
 	LeaderLabelValue = "true"
 )
 
