@@ -24,6 +24,8 @@ const (
 	retryPeriod   = 2 * time.Second
 
 	labelClearAttempts = 5
+	// Cap exponential backoff after setLeaderLabel failures at retryPeriod<<4 (32s).
+	maxLabelFailShift = 4
 
 	serviceAccountNamespacePath = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
 
@@ -87,6 +89,9 @@ func Run(ctx context.Context, cfg Config) {
 	// heldLeadership tracks whether we successfully became leader so demote
 	// signaling runs at most once per leadership term and only after real leadership.
 	var heldLeadership atomic.Bool
+	// consecutiveLabelFails backs off re-entry after setLeaderLabel failures so
+	// permanent errors (e.g. RBAC) do not tight-loop against the API server.
+	var consecutiveLabelFails atomic.Int32
 
 	// term is the in-flight election round. WaitGroup.Add(1) happens on this
 	// goroutine before RunOrDie so Wait cannot race a zero-counter Add from the
@@ -127,14 +132,17 @@ func Run(ctx context.Context, cfg Config) {
 				// Set the Service selector label before advertising leadership.
 				// On failure, cancel only this term so the outer loop can retry.
 				if err := setLeaderLabel(leCtx, client, namespace, identity); err != nil {
+					fails := consecutiveLabelFails.Add(1)
 					slogs.Logr.Error("setting leader label",
 						"error", err,
 						"namespace", namespace,
 						"pod", identity,
+						"consecutive_failures", fails,
 					)
 					t.cancel()
 					return
 				}
+				consecutiveLabelFails.Store(0)
 				leading.Store(true)
 				heldLeadership.Store(true)
 
@@ -195,6 +203,27 @@ func Run(ctx context.Context, cfg Config) {
 		if ctx.Err() != nil {
 			return
 		}
+
+		if fails := consecutiveLabelFails.Load(); fails > 0 {
+			shift := fails - 1
+			if shift > maxLabelFailShift {
+				shift = maxLabelFailShift
+			}
+			backoff := retryPeriod << shift
+			slogs.Logr.Warn("backing off before re-entering election after label failure",
+				"backoff", backoff,
+				"consecutive_failures", fails,
+				"lease", cfg.LeaseName,
+			)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+		}
+
 		slogs.Logr.Info("lease lost; re-entering leader election",
 			"lease", cfg.LeaseName,
 			"namespace", namespace,
