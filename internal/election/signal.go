@@ -65,6 +65,7 @@ func signalOnStoppedLeading(cfg Config) {
 	}
 
 	sig := cfg.demoteSignal()
+	selfTGID := threadGroupID("self")
 	pids, err := findPIDsByCmdline(match)
 	if err != nil {
 		slogs.Logr.Error("scanning processes for demote signal",
@@ -74,10 +75,9 @@ func signalOnStoppedLeading(cfg Config) {
 		return
 	}
 
-	self := os.Getpid()
 	targets := pids[:0]
 	for _, pid := range pids {
-		if pid == self {
+		if selfTGID > 0 && pid == selfTGID {
 			continue
 		}
 		targets = append(targets, pid)
@@ -86,7 +86,7 @@ func signalOnStoppedLeading(cfg Config) {
 		slogs.Logr.Error("no processes matched for demote signal",
 			"match", match,
 			"signal", sig.String(),
-			"self_pid", self,
+			"self_tgid", selfTGID,
 			"matched_only_self", len(pids) > 0,
 		)
 		return
@@ -128,6 +128,10 @@ func findPIDsByCmdline(substr string) ([]int, error) {
 		if err != nil {
 			continue
 		}
+		// /proc may expose thread TIDs; only signal thread-group leaders once.
+		if !isThreadGroupLeader(ent.Name()) {
+			continue
+		}
 		cmdline, err := os.ReadFile(filepath.Join("/proc", ent.Name(), "cmdline"))
 		if err != nil {
 			continue
@@ -146,4 +150,32 @@ func cmdlineNeedle(substr string) []byte {
 		return nil
 	}
 	return []byte(strings.Join(fields, "\x00"))
+}
+
+// isThreadGroupLeader reports whether /proc/<id> is a process (TGID) rather than
+// a non-leader thread TID.
+func isThreadGroupLeader(procID string) bool {
+	pid, tgid := pidAndTgid(procID)
+	return pid > 0 && pid == tgid
+}
+
+func threadGroupID(procID string) int {
+	_, tgid := pidAndTgid(procID)
+	return tgid
+}
+
+func pidAndTgid(procID string) (pid, tgid int) {
+	data, err := os.ReadFile(filepath.Join("/proc", procID, "status"))
+	if err != nil {
+		return 0, 0
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		switch {
+		case strings.HasPrefix(line, "Pid:"):
+			pid, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "Pid:")))
+		case strings.HasPrefix(line, "Tgid:"):
+			tgid, _ = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "Tgid:")))
+		}
+	}
+	return pid, tgid
 }
