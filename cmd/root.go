@@ -5,12 +5,12 @@ import (
 	"os"
 	"strings"
 
+	"github.com/chia-network/go-modules/pkg/slogs"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
 
 var (
-	cfgFile    string
 	gitVersion string
 	buildTime  string
 )
@@ -41,24 +41,23 @@ func Execute() {
 
 func init() {
 	cobra.OnInitialize(initConfig)
-	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "", "config file (default is $HOME/.service-leader-elector.yaml)")
+	cobra.OnInitialize(InitLogs)
+
+	rootCmd.PersistentFlags().String("log-level", "info", "The log-level for the application, can be one of info, warn, error, debug.")
+
+	cobra.CheckErr(viper.BindPFlag("log-level", rootCmd.PersistentFlags().Lookup("log-level")))
 }
 
 // initConfig reads in config file and ENV variables if set.
 func initConfig() {
-	if cfgFile != "" {
-		// Use config file from the flag.
-		viper.SetConfigFile(cfgFile)
-	} else {
-		// Find home directory.
-		home, err := os.UserHomeDir()
-		cobra.CheckErr(err)
+	// Find home directory.
+	home, err := os.UserHomeDir()
+	cobra.CheckErr(err)
 
-		// Search config in home directory with name ".chia-exporter" (without extension).
-		viper.AddConfigPath(home)
-		viper.SetConfigType("yaml")
-		viper.SetConfigName(".service-leader-elector")
-	}
+	// Search config in home directory with name ".chia-exporter" (without extension).
+	viper.AddConfigPath(home)
+	viper.SetConfigType("yaml")
+	viper.SetConfigName(".service-leader-elector")
 
 	viper.SetEnvPrefix("SERVICE_LEADER_ELECTOR")
 	viper.SetEnvKeyReplacer(strings.NewReplacer("-", "_"))
@@ -68,4 +67,9 @@ func initConfig() {
 	if err := viper.ReadInConfig(); err == nil {
 		fmt.Fprintln(os.Stderr, "Using config file:", viper.ConfigFileUsed())
 	}
+}
+
+// InitLogs sets up the logger
+func InitLogs() {
+	slogs.Init(viper.GetString("log-level"))
 }

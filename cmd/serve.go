@@ -1,8 +1,7 @@
 package cmd
 
 import (
-	"fmt"
-
+	"github.com/chia-network/go-modules/pkg/slogs"
 	"github.com/spf13/cobra"
 )
 
@@ -11,7 +10,7 @@ var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Runs the readiness probe server",
 	Run: func(cmd *cobra.Command, args []string) {
-		fmt.Println("serve called")
+		slogs.Logr.Info("Serve Called")
 	},
 }
 
