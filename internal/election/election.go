@@ -122,8 +122,8 @@ func Run(ctx context.Context, cfg Config) {
 						leading.Store(false)
 						if labelSet {
 							clearLeaderLabelUntilSuccess(ctx, client, namespace, identity)
+							signalOnStoppedLeading(cfg)
 						}
-						signalOnStoppedLeading(cfg)
 					}()
 
 					if err := setLeaderLabel(leCtx, client, namespace, identity); err != nil {
@@ -132,6 +132,9 @@ func Run(ctx context.Context, cfg Config) {
 							"namespace", namespace,
 							"pod", identity,
 						)
+						// Cancel the term so the lease is released (ReleaseOnCancel)
+						// and other candidates can acquire it.
+						termCancel()
 						return
 					}
 					labelSet = true
