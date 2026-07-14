@@ -13,24 +13,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// Config controls leader election and optional demote signaling.
-type Config struct {
-	LeaseName string
-
-	// OnStoppedLeadingProcess, if non-empty, enables signaling processes whose
-	// /proc/<pid>/cmdline contains this substring when this instance stops leading.
-	OnStoppedLeadingProcess string
-	// OnStoppedLeadingSignal is the signal to send (default SIGTERM).
-	OnStoppedLeadingSignal syscall.Signal
-}
-
-func (c Config) demoteSignal() syscall.Signal {
-	if c.OnStoppedLeadingSignal == 0 {
-		return syscall.SIGTERM
-	}
-	return c.OnStoppedLeadingSignal
-}
-
 // ParseSignal converts names like SIGTERM/TERM/15 into a signal.
 func ParseSignal(s string) (syscall.Signal, error) {
 	s = strings.TrimSpace(strings.ToUpper(s))
@@ -66,7 +48,11 @@ func signalOnStoppedLeading(cfg Config) bool {
 		return false
 	}
 
-	sig := cfg.demoteSignal()
+	sig := cfg.OnStoppedLeadingSignal
+	if sig == 0 {
+		sig = syscall.SIGTERM
+	}
+
 	selfTGID := threadGroupID("self")
 	pids, err := findPIDsByCmdline(match)
 	if err != nil {
