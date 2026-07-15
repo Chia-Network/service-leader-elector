@@ -107,6 +107,11 @@ func Run(ctx context.Context, cfg Config) {
 		done := make(chan struct{})
 		termCtx, termCancel := context.WithCancel(ctx)
 
+		// Set in OnStartedLeading's defer when shutdown occurs while leading.
+		// Signals the main loop to wait for a new leader before clearing the label,
+		// so the leader Service never has zero endpoints during a rollout.
+		var needsDeferredCleanup bool
+
 		lec := leaderelection.LeaderElectionConfig{
 			Lock:            lock,
 			LeaseDuration:   leaseDuration,
@@ -120,10 +125,19 @@ func Run(ctx context.Context, cfg Config) {
 					var labelSet bool
 					defer func() {
 						leading.Store(false)
-						if labelSet {
-							clearLeaderLabelUntilSuccess(ctx, client, namespace, identity)
-							signalOnStoppedLeading(cfg)
+						if !labelSet {
+							return
 						}
+						// On shutdown (SIGTERM), keep the label so the leader
+						// Service retains endpoints while another pod acquires
+						// the lease. The main loop handles cleanup after
+						// waiting for a new leader.
+						if ctx.Err() != nil {
+							needsDeferredCleanup = true
+							return
+						}
+						clearLeaderLabelUntilSuccess(ctx, client, namespace, identity)
+						signalOnStoppedLeading(cfg)
 					}()
 
 					if err := setLeaderLabel(leCtx, client, namespace, identity); err != nil {
@@ -170,12 +184,42 @@ func Run(ctx context.Context, cfg Config) {
 
 		leaderelection.RunOrDie(termCtx, lec)
 
-		wasLeader := waitForDone(ctx, done)
-		termCancel()
-
+		// On shutdown, wait for OnStartedLeading's defer to finish so
+		// needsDeferredCleanup is set before we read it. The defer is fast
+		// on shutdown (just sets a bool), so the timeout handles the case
+		// where OnStartedLeading never ran this term.
 		if ctx.Err() != nil {
+			select {
+			case <-done:
+			case <-time.After(retryPeriod):
+			}
+			termCancel()
+
+			if needsDeferredCleanup {
+				slogs.Logr.Info("lease resigned, waiting for new leader before clearing label",
+					"lease", cfg.LeaseName,
+					"timeout", leaseDuration,
+				)
+				if waitForNewLeader(client, namespace, cfg.LeaseName, identity, leaseDuration) {
+					slogs.Logr.Info("new leader confirmed, clearing label",
+						"lease", cfg.LeaseName,
+					)
+				} else {
+					slogs.Logr.Warn("timed out waiting for new leader, clearing label anyway",
+						"lease", cfg.LeaseName,
+						"timeout", leaseDuration,
+					)
+				}
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				clearLeaderLabelUntilSuccess(cleanupCtx, client, namespace, identity)
+				cleanupCancel()
+				signalOnStoppedLeading(cfg)
+			}
 			return
 		}
+
+		wasLeader := waitForDone(ctx, done)
+		termCancel()
 
 		if wasLeader {
 			slogs.Logr.Info("backing off before re-entering election after demotion",
@@ -205,6 +249,33 @@ func waitForDone(ctx context.Context, done <-chan struct{}) (wasLeader bool) {
 		return false
 	case <-ctx.Done():
 		return false
+	}
+}
+
+// waitForNewLeader polls the Lease until a different pod holds it or timeout
+// expires. Returns true if a new leader was observed.
+func waitForNewLeader(client kubernetes.Interface, namespace, leaseName, selfIdentity string, timeout time.Duration) bool {
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-deadline:
+			return false
+		case <-ticker.C:
+			lease, err := client.CoordinationV1().Leases(namespace).Get(
+				context.Background(), leaseName, metav1.GetOptions{},
+			)
+			if err != nil {
+				slogs.Logr.Debug("polling lease for new leader", "error", err)
+				continue
+			}
+			if lease.Spec.HolderIdentity != nil &&
+				*lease.Spec.HolderIdentity != "" &&
+				*lease.Spec.HolderIdentity != selfIdentity {
+				return true
+			}
+		}
 	}
 }
 
