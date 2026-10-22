@@ -43,3 +43,17 @@ updates:
       - github_actions
       - "Changed"
     reviewers: ["cameroncooper", "emlowe"]
+
+  - package-ecosystem: docker
+    directories: ["/"]
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 10
+    rebase-strategy: auto
+    labels:
+      - dependencies
+      - docker
+      - "Changed"
