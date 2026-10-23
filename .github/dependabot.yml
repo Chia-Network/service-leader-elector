@@ -2,16 +2,9 @@
 # inline with the upstream template, unless you add !dependabot to the repo's managed-files property
 
 version: 2
-registries:
-  chia-pypi:
-    type: python-index
-    url: https://pypi.chia.net/simple/
-  chia-downloads:
-    type: python-index
-    url: https://download.chia.net/simple/
 updates:
   - package-ecosystem: "gomod"
-    directory: /
+    directories: ["/"]
     schedule:
       interval: "weekly"
       day: "tuesday"
@@ -28,7 +21,6 @@ updates:
       global:
         patterns:
           - "*"
-
   - package-ecosystem: "github-actions"
     directories: ["/", ".github/actions/*"]
     schedule:
@@ -43,7 +35,6 @@ updates:
       - github_actions
       - "Changed"
     reviewers: ["cameroncooper", "emlowe"]
-
   - package-ecosystem: docker
     directories: ["/"]
     schedule:
@@ -57,3 +48,4 @@ updates:
       - dependencies
       - docker
       - "Changed"
+    reviewers: ["cameroncooper", "emlowe"]
