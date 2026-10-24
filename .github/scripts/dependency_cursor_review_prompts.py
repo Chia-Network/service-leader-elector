@@ -6,15 +6,18 @@ import json
 import os
 import re
 import secrets
-import tempfile
 from pathlib import Path
 
 _SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}\Z")
 
 
-def _read_file(path: str) -> str:
+def _out_dir() -> Path:
+    return Path(os.environ["DCR_OUT"])
+
+
+def _read_file(name: str) -> str:
     try:
-        return Path(path).read_text(encoding="utf-8")
+        return (_out_dir() / name).read_text(encoding="utf-8")
     except FileNotFoundError:
         return ""
 
@@ -81,7 +84,7 @@ def _prompt_fields() -> dict[str, str]:
         "resolved_to": os.getenv("RESOLVED_TO", ""),
     }
     try:
-        report = json.loads(Path("malware_scan_report.json").read_text(encoding="utf-8"))
+        report = json.loads((_out_dir() / "malware_scan_report.json").read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return env_fields
     if not isinstance(report, dict) or "agent_target" not in report:
@@ -208,7 +211,7 @@ Codepoint matches in binary or media blobs are not text findings and are context
 A changed media path is still a steganography signal.
 You may only agree with blocking findings or escalate them.
 Generic exec, spawn, child_process, base64, and eval hits are context, including inside compiled
-bundles. Other heuristic hits stay blocking unless the scan report is warn_only.
+bundles. Other heuristic hits are blocking.
 status clean with scan_conclusive true means release blobs were read and no findings were produced.
 status warn or fail means findings were produced from blobs that were read. Incorporate them.
 If scan_conclusive is false, coverage was incomplete, so do not treat the absence of further findings as a clean result.
@@ -234,14 +237,6 @@ Then explain your reasoning briefly with top evidence.
 Do not include intermediate reasoning or self-talk.
 Keep it concise and actionable.
 """.strip()
-
-
-def _publish_text(path: Path, text: str) -> None:
-    """Replace the entry at path with a new file, so a link there is replaced, not followed."""
-    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(text)
-    os.replace(tmp, path)
 
 
 def main() -> None:
@@ -276,8 +271,8 @@ Do not include intermediate reasoning or self-talk.
 Keep it concise and actionable.
 """.strip()
 
-    _publish_text(Path("cursor_prompt_malware.txt"), malware_prompt)
-    _publish_text(Path("cursor_prompt_compatibility.txt"), compatibility_prompt)
+    (_out_dir() / "cursor_prompt_malware.txt").write_text(malware_prompt, encoding="utf-8")
+    (_out_dir() / "cursor_prompt_compatibility.txt").write_text(compatibility_prompt, encoding="utf-8")
 
 
 if __name__ == "__main__":
